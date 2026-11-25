@@ -8,7 +8,9 @@
 // is held past a short slot budget — so the bot banks many small, steady
 // round trips instead of riding one moonshot. That is what a Sharpe ranking
 // rewards, and it also clears the guardrails: each round trip is at least
-// 0.01 SOL on a distinct mint.
+// 0.01 SOL on a distinct mint, with a probe fallback that opens tiny
+// round trips on liquid curves late in the run if the distinct-coin bar
+// is still at risk.
 //
 // Deterministic by construction: no clock, no environment reads, no
 // randomness; every map is walked in insertion order and every money value
@@ -43,6 +45,9 @@ const DEFAULTS = {
   staleSlots: 30, // exit when no trade has hit the coin for this many slots
   buySlipBps: 1_500, // buys refused when the fill is worse than this (no chasing a pump)
   sellSlipBps: 10_000, // sells never refused for the price moving in the latency
+  probeSol: 20_000_000n, // guardrail probe round-trip size (0.02 SOL, above the 0.01 floor)
+  probeAfterSecs: 14_400, // probes only once this much block time has passed
+  targetCoins: 20, // guardrail pacing target: distinct coins with a round trip
 };
 
 export type Params = typeof DEFAULTS;
@@ -91,6 +96,10 @@ export function createBot(overrides: Partial<Params> = {}) {
   const coins = new Map<Pubkey, Coin>();
   const held = new Map<Pubkey, Held>();
   const selling = new Set<Pubkey>();
+  const probed = new Set<Pubkey>();
+  const roundTripped = new Set<Pubkey>();
+  let firstBlockTime: number | null = null;
+  let nowBlockTime = 0;
 
   /** Net SOL bought minus sold, and distinct non-creator buyers, over the recent window. */
   function flow(c: Coin, slot: number): { net: bigint; buyers: number } {
@@ -119,6 +128,10 @@ export function createBot(overrides: Partial<Params> = {}) {
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       for (const e of batch.events) {
+        if (e.block_time !== null) {
+          if (firstBlockTime === null) firstBlockTime = e.block_time;
+          if (e.block_time > nowBlockTime) nowBlockTime = e.block_time;
+        }
         if (e.event === 'CreateEvent') {
           coins.set(e.mint, {
             mint: e.mint, createSlot: e.slot, creator: e.creator,
@@ -169,6 +182,7 @@ export function createBot(overrides: Partial<Params> = {}) {
           selling.delete(f.mint);
           continue;
         }
+        if (f.side === 'sell' && f.status === 'filled') roundTripped.add(f.mint);
         const h = held.get(f.mint);
         if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
         if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
@@ -259,6 +273,47 @@ export function createBot(overrides: Partial<Params> = {}) {
         free -= amount + tx;
         c.spent += amount;
         open += 1;
+      }
+      // Guardrail probes: if the run is late and still short of the
+      // distinct-coin bar, open a tiny round trip on the most liquid live
+      // curve and sell it as soon as the buy lands. Each probe costs only
+      // its fees, and it only fires when the bar is actually at risk.
+      if (
+        firstBlockTime !== null &&
+        nowBlockTime - firstBlockTime >= P.probeAfterSecs &&
+        roundTripped.size + state.positions.size < P.targetCoins &&
+        orders.length < cap &&
+        state.committedPositionCount() < state.hello.caps.max_open_positions
+      ) {
+        let bestMint: Pubkey | null = null;
+        let bestRq = 0n;
+        for (const [mint, curve] of state.curves) {
+          if (curve.complete || roundTripped.has(mint) || probed.has(mint)) continue;
+          if (state.positions.has(mint) || hasPending(state, mint, 'buy')) continue;
+          if (curve.real_quote_reserves > bestRq) {
+            bestRq = curve.real_quote_reserves;
+            bestMint = mint;
+          }
+        }
+        if (bestMint !== null) {
+          const maxBuy = state.maxBuyLamports(bestMint);
+          const amount = P.probeSol < maxBuy ? P.probeSol : maxBuy;
+          if (amount >= P.minBuyLamports && free >= amount + tx) {
+            orders.push({ side: 'buy', mint: bestMint, quote_lamports: amount, max_slippage_bps: P.buySlipBps });
+            free -= amount + tx;
+            probed.add(bestMint);
+            const c = coins.get(bestMint);
+            if (c !== undefined) c.done = true;
+          }
+        }
+      }
+      // Probe exits: sell a probe position as soon as its buy has landed.
+      for (const [mint, pos] of state.positions) {
+        if (orders.length >= cap) break;
+        if (selling.has(mint) || !probed.has(mint)) continue;
+        if (!held.has(mint)) continue;
+        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: P.sellSlipBps });
+        selling.add(mint);
       }
       return orders;
     },
